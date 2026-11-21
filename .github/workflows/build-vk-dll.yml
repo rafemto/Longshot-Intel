@@ -1,0 +1,94 @@
+# Builds ONLY longshot_vk.dll (Windows x64) from Longshot v3.0.0 with the Intel patch in overlay/,
+# replicating upstream's own CI recipe (.forgejo/workflows/build-windows.yml, job "vulkan"):
+# llvm-mingw cross-compile on Linux, RX_VK_ONLY=1. The DLL is published as a workflow artifact
+# and attached to the release "vk-dll-v3.0.0-intel" when that release exists.
+name: Build longshot_vk.dll (Intel patch)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'overlay/**'
+      - '.github/workflows/build-vk-dll.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  vulkan:
+    name: Windows Vulkan back end (llvm-mingw)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out this patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patch
+
+      - name: Clone Longshot v3.0.0 (upstream, Forgejo)
+        run: |
+          git clone --depth 1 --branch v3.0.0 https://git.magicbean.dev/MagicBeanDev/Longshot.git src
+          git -C src rev-parse HEAD
+
+      - name: Apply the Intel patch overlay
+        run: |
+          cp patch/overlay/gpu/vk/vk_draw.cpp   src/gpu/vk/vk_draw.cpp
+          cp patch/overlay/gpu/vk/vk_draw.h     src/gpu/vk/vk_draw.h
+          cp patch/overlay/gpu/vk/switches.def  src/gpu/vk/switches.def
+          cp patch/overlay/tests/test_pcache_fetch_lock.py    src/tests/test_pcache_fetch_lock.py
+          cp patch/overlay/tests/pipeline_cache_save_test.cpp src/tests/pipeline_cache_save_test.cpp
+          cp patch/overlay/tests/pipeline_play_cache_test.cpp src/tests/pipeline_play_cache_test.cpp
+          grep -n "guarded_pipeline_layout" src/gpu/vk/vk_draw.cpp | head -3
+
+      # (the headers in the CPM cache layout nx2/build.py reads, at the versions upstream's CI pins)
+      - name: Check out pinned Vulkan headers
+        working-directory: src
+        run: scripts/fetch_commit.sh https://github.com/KhronosGroup/Vulkan-Headers 74d8a6cb930c68ef617b202c3ff3c59d919e086b _deps/cpm/vulkanheaders/v1.4.345
+      - name: Check out pinned SPIR-V headers
+        working-directory: src
+        run: scripts/fetch_commit.sh https://github.com/KhronosGroup/SPIRV-Headers 04f10f650d514df88b76d25e83db360142c7b174 _deps/cpm/spirv-headers/vulkan-sdk-1.4.341.0
+      - name: Check out pinned VulkanMemoryAllocator
+        working-directory: src
+        run: scripts/fetch_commit.sh https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator 1d8f600fd424278486eade7ed3e877c99f0846b1 _deps/cpm/vulkanmemoryallocator/v3.3.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: llvm-mingw
+        working-directory: src
+        run: |
+          echo "LONGSHOT_MINGW=$(python -I scripts/builder_package.py llvm-mingw "$RUNNER_TEMP/llvm" --host linux)" >> "$GITHUB_ENV"
+          echo "RX_TARGET=windows" >> "$GITHUB_ENV"
+
+      - name: longshot_vk.dll
+        working-directory: src
+        env:
+          RX_VK_ONLY: '1'
+          RX_RELEASE: '1'
+        run: |
+          OOT_WORK="$RUNNER_TEMP/vk-work" RX_CPM="$GITHUB_WORKSPACE/src/_deps/cpm" \
+            python -I nx2/build.py --standalone --jobs "$(nproc)"
+          ls -l "$RUNNER_TEMP/vk-work/sa/build/longshot_vk.dll"
+          cp "$RUNNER_TEMP/vk-work/sa/build/longshot_vk.dll" "$GITHUB_WORKSPACE/longshot_vk.dll"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: longshot_vk-intel
+          path: longshot_vk.dll
+          if-no-files-found: error
+
+      - name: Attach to the release (when it exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view vk-dll-v3.0.0-intel --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload vk-dll-v3.0.0-intel longshot_vk.dll --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create vk-dll-v3.0.0-intel longshot_vk.dll --repo "$GITHUB_REPOSITORY" \
+              --title "longshot_vk.dll v3.0.0 + parche Intel" \
+              --notes "DLL del render Vulkan de Longshot v3.0.0 con el parche Intel: guardias SEH en vkCreatePipelineLayout y vkGetPipelineCacheData, y pipelines gráficos sin el optimizador del driver en Intel integrada (UHD 620). Sustituye a la longshot_vk.dll original junto al juego (respáldala antes)."
+          fi
