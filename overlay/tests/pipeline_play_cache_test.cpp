@@ -1,0 +1,635 @@
+// The play caches and init of gpu/vk/vk_draw.cpp, extracted unmodified, on a model of
+// Vulkan pipeline caches: a cache is a set of pipeline keys, its data "FAKE" and the keys. The driver keeps a disk cache of its own,
+// and, as NVIDIA's does, copies a pipeline it takes from there into the cache the pipeline is asked of. No driver is loaded.
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <mutex>
+#include <set>
+#include <shared_mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include "compute_gate.h"   // the scoped Linux memory budget in the extracted pcache_load_off
+#ifdef _WIN32
+#define NOMINMAX   // (the extracted code calls std::max: no min/max macros from windows.h)
+#include <windows.h>
+#else
+constexpr unsigned MOVEFILE_REPLACE_EXISTING = 1;
+void Sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+#endif
+
+using VkResult = int;
+constexpr VkResult VK_SUCCESS = 0, VK_ERROR_UNKNOWN = -13, VK_PIPELINE_COMPILE_REQUIRED = 1000297000;
+constexpr unsigned VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT = 0x100;
+constexpr unsigned VK_PIPELINE_CREATE_LIBRARY_BIT_KHR = 0x800;
+enum { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO = 17 };
+struct FakeCache {
+    std::mutex mu;
+    std::set<uint64_t> keys;
+};
+struct FakePipeline {};
+using VkPipelineCache = FakeCache*;
+using VkPipeline = FakePipeline*;
+#define VK_NULL_HANDLE nullptr
+struct VkPipelineCacheCreateInfo {
+    int sType;
+    const void* pNext = nullptr;
+    unsigned flags = 0;
+    size_t initialDataSize = 0;
+    const void* pInitialData = nullptr;
+};
+struct {
+    int device = 1;
+    struct { bool pipelineCreationCacheControl = true; } vk13;
+    struct { unsigned vendorID = 0; } props;
+    // (dev.policy, which pcache_fetch_lock_on and serial_builds_on read: gpu/vk/device_policy.h makes the two of the GPU's
+    // driver and their switches. Here, not Intel's Windows driver: the fetch lock only with RX_VK_PCACHE_FETCH_LOCK=1, the
+    // case lock-users, and the builds not serial)
+    struct {
+        bool pcache_fetch_lock = [] {
+            const char* e = std::getenv("RX_VK_PCACHE_FETCH_LOCK");
+            return e && *e && std::strcmp(e, "0") != 0;
+        }();
+        bool compute_builds_serial = false;
+    } policy;
+} dev;
+VkPipelineCache pcache = nullptr;
+bool pcache_no_save = false;   // (pcache_init sets this in the renderer)
+bool pcache_file_rejected = false;   // (pcache_init: the cache's file was another driver's)
+std::atomic<size_t> pcache_saved_size{0};
+std::string pcache_dir, pcache_path;
+// (vk_draw.cpp's ordinary save, pipeline_cache_save, extracted unmodified after the play caches: the no-save-periodic case. What the
+// builds count towards a save, and the cache's data size last read or written)
+std::atomic<int64_t> pcache_built_since_save{0};
+thread_local bool pcache_save_between = false;   // (vk_draw.cpp: a save run between two serial builds, Intel; not here)
+std::atomic<bool> pcache_save_owed{false};
+std::atomic<int> creates{0}, destroys{0}, merges{0}, compiles{0}, failed_moves{0};
+std::atomic<int> fail_moves{0};   // (the next moves into place that fail)
+FakePipeline the_pipeline;
+std::atomic<int> cache_reads{0}, cache_data_writes{0}, cache_publications{0}, pipeline_calls{0}, temporary_cleanups{0};
+// (vk_draw.cpp's fetch lock, PcacheFetch and PcacheUse, extracted unmodified: on Intel a fetch of a cache's data and the
+// builds with it take turns; off here unless RX_VK_PCACHE_FETCH_LOCK=1, the case lock-users)
+#include "compat/longshot_env.h"
+#include "pcache_fetch_lock.inc"
+
+#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); return 1; } } while (0)
+
+void predicted_use_log() {}   // (vk_draw.cpp: the predicted pipelines play met, after each play file)
+void logf(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    std::fputc('\n', stderr);
+}
+std::set<uint64_t> parse(const uint8_t* p, size_t n) {
+    std::set<uint64_t> keys;
+    for (size_t at = 4; at + 8 <= n; at += 8) {
+        uint64_t k;
+        std::memcpy(&k, p + at, 8);
+        keys.insert(k);
+    }
+    return keys;
+}
+/// (vk_draw.cpp's own checks the header: here a file not starting "FAKE" is another driver's)
+static bool fail_reads = false, fail_cache_create = false;
+struct ReadPart : std::vector<uint8_t> {
+    bool incompatible = false;
+    static size_t cleanup_temporaries(const std::string&) { ++temporary_cleanups; return 0; }
+    bool rejected() const { return incompatible; }
+    bool reset() { clear(); incompatible=false; return true; }
+};
+ReadPart pcache_file_read(const std::string& path) {
+    ++cache_reads;
+    ReadPart data;
+    if (fail_reads) return data;
+    if (FILE* f = std::fopen(path.c_str(), "rb")) {
+        uint8_t buf[4096];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + n);
+        std::fclose(f);
+    }
+    if (data.size() < 4 || std::memcmp(data.data(), "FAKE", 4)) { data.clear(); data.incompatible = true; }
+    return data;
+}
+VkResult vkCreatePipelineCache(int, const VkPipelineCacheCreateInfo* ci, const void*, VkPipelineCache* out) {
+    if (fail_cache_create) return VK_ERROR_UNKNOWN;
+    auto* c = new FakeCache;
+    if (ci->initialDataSize) c->keys = parse((const uint8_t*)ci->pInitialData, ci->initialDataSize);
+    ++creates;
+    *out = c;
+    return VK_SUCCESS;
+}
+void vkDestroyPipelineCache(int, VkPipelineCache c, const void*) {
+    ++destroys;
+    delete c;
+}
+VkResult vkGetPipelineCacheData(int, VkPipelineCache c, size_t* n, void* data) {
+    std::lock_guard lk(c->mu);
+    const size_t size = 4 + 8 * c->keys.size();
+    if (!data) return *n = size, VK_SUCCESS;
+    if (*n < size) return VK_ERROR_UNKNOWN;
+    ++cache_data_writes;
+    auto* p = (uint8_t*)data;
+    std::memcpy(p, "FAKE", 4);
+    size_t at = 4;
+    for (uint64_t k : c->keys) std::memcpy(p + at, &k, 8), at += 8;
+    *n = size;
+    return VK_SUCCESS;
+}
+// (the guarded fetch the cuts call, vk_draw.cpp extern_guarded_pipeline_cache_data: here it is the fake above,
+// unguarded — a fixture has no driver to fault)
+VkResult extern_guarded_pipeline_cache_data(VkPipelineCache c, size_t* n, void* data) {
+    return vkGetPipelineCacheData(0, c, n, data);
+}
+VkResult vkMergePipelineCaches(int, VkPipelineCache dst, uint32_t count, const VkPipelineCache* src) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (src[i] == dst) std::abort();
+        std::scoped_lock lk(dst->mu, src[i]->mu);
+        dst->keys.insert(src[i]->keys.begin(), src[i]->keys.end());
+    }
+    ++merges;
+    return VK_SUCCESS;
+}
+int move_into_place(const char* from, const char* to, unsigned flags) {
+    if (flags != MOVEFILE_REPLACE_EXISTING) std::abort();
+    if (fail_moves.load() > 0) {
+        --fail_moves, ++failed_moves;
+        return 0;
+    }
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    return !ec;
+}
+
+// ---- the driver: its own disk cache, and what a pipeline's making does to the cache it is asked of ----
+std::mutex driver_mu;
+std::set<uint64_t> driver;
+std::atomic<uint64_t> block_key{0};   // (a compile of this key waits for release: one under way while a save comes)
+std::atomic<bool> blocked{false}, release{false};
+struct FakeCI {
+    unsigned flags = 0;
+    uint64_t key = 0;
+};
+bool has(VkPipelineCache c, uint64_t key) {
+    std::lock_guard lk(c->mu);
+    return c->keys.count(key) != 0;
+}
+VkResult fake_create(VkPipelineCache c, const FakeCI* ci, VkPipeline* pl) {
+    ++pipeline_calls;
+    *pl = (VkPipeline)&driver;   // (not a pipeline: the caller must not take it on failure)
+    if (!c) std::abort();
+    if (ci->flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {
+        if (has(c, ci->key)) return *pl = &the_pipeline, VK_SUCCESS;
+        bool in_driver;
+        {
+            std::lock_guard lk(driver_mu);
+            in_driver = driver.count(ci->key) != 0;
+        }
+        if (!in_driver) return VK_PIPELINE_COMPILE_REQUIRED;
+        std::lock_guard lk(c->mu);
+        c->keys.insert(ci->key);   // (NVIDIA: what it takes from its own cache goes into the one asked)
+        return *pl = &the_pipeline, VK_SUCCESS;
+    }
+    ++compiles;
+    if (ci->key == block_key.load()) {
+        blocked = true;
+        while (!release.load()) Sleep(1);
+    }
+    {
+        std::lock_guard lk(driver_mu);
+        driver.insert(ci->key);
+    }
+    std::lock_guard lk(c->mu);
+    c->keys.insert(ci->key);
+    return *pl = &the_pipeline, VK_SUCCESS;
+}
+// (vk_draw.cpp guarded_graphics_held: a build with a cache holds the fetch lock shared for that one build. gap_key: before its
+// ask of the start's cache that build waits, holding nothing, as a build can between two of create_cached's builds)
+std::atomic<uint64_t> gap_key{0};
+std::atomic<bool> in_gap{false}, gap_go{false};
+VkResult fake_create_held(VkPipelineCache c, const FakeCI* ci, VkPipeline* pl) {
+    if (gap_key.load() && ci->key == gap_key.load() && c == pcache) {
+        in_gap = true;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!gap_go.load() && std::chrono::steady_clock::now() < end) Sleep(1);
+    }
+    PcacheUse use(c);
+    return fake_create(c, ci, pl);
+}
+
+#ifdef _WIN32
+static BOOL mapped_move(LPCWSTR from, LPCWSTR to, DWORD flags) {
+    ++cache_publications;
+    if (fail_moves.load() > 0) { --fail_moves; ++failed_moves; return FALSE; }
+    return MoveFileExW(from, to, flags);
+}
+#define MoveFileExW mapped_move
+#else
+static int mapped_move(const char* from, const char* to) {
+    ++cache_publications;
+    if (fail_moves.load() > 0) { --fail_moves; ++failed_moves; return -1; }
+    return rename(from, to);
+}
+#define rename mapped_move
+#endif
+#include "pipeline_cache_file.h"
+using mkwvk::PipelineCacheFile;
+#ifdef _WIN32
+#undef MoveFileExW
+#else
+#undef rename
+#endif
+// (the census's counters, gpu/vk/vk_programs.h: counted, not checked here)
+struct { std::atomic<int64_t> play_from_driver{0}, play_from_start{0}, play_compiled{0}; } census;
+thread_local struct { uint8_t made_how = 0; } use_counters;
+#include "pipeline_play_cache.inc"
+#include "pipeline_cache_save.inc"
+
+std::string cache_path(const char*) { return pcache_dir; }
+uint64_t program_cache_stamp() { return 17; }
+namespace pcache_stamp {
+struct Dropped { size_t files; uint64_t bytes; };
+Dropped check(const std::string&, uint64_t) { return {0, 0}; }
+}
+// (init's conditional read uses the read-result stub; play writes keep the real mapped-file writer)
+#define PipelineCacheFile ReadPart
+#include "pcache_init.inc"
+#undef PipelineCacheFile
+
+VkResult make(uint64_t key, unsigned flags = 0) {
+    FakeCI ci;
+    ci.key = key, ci.flags = flags;
+    VkPipeline pl = VK_NULL_HANDLE;
+    const VkResult r = create_cached(pcache_fetch_lock_on() ? fake_create_held : fake_create, &ci, &pl);
+    if ((r == VK_SUCCESS) != (pl == &the_pipeline)) std::abort();   // (a failure leaves no pipeline behind)
+    return r;
+}
+std::set<uint64_t> keys_of(VkPipelineCache c) {
+    std::lock_guard lk(c->mu);
+    return c->keys;
+}
+size_t size_of(VkPipelineCache c) {
+    size_t n = 0;
+    vkGetPipelineCacheData(dev.device, c, &n, nullptr);
+    return n;
+}
+template <class F>
+bool wait_for(F done) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done() && std::chrono::steady_clock::now() < end) Sleep(1);
+    return done();
+}
+bool exists(const std::string& path) {
+    return std::filesystem::exists(path);
+}
+std::set<uint64_t> file_keys(const std::string& path) {
+    const std::vector<uint8_t> data = pcache_file_read(path);
+    return data.empty() ? std::set<uint64_t>{} : parse(data.data(), data.size());
+}
+void write_file(const std::string& path, const std::string& head, std::set<uint64_t> keys) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    std::fwrite(head.data(), 1, head.size(), f);
+    for (uint64_t k : keys) std::fwrite(&k, 8, 1, f);
+    std::fclose(f);
+}
+std::string at(const char* name) {
+    return pcache_dir + name;
+}
+VkPipelineCache cache_of(std::set<uint64_t> keys) {
+    VkPipelineCache c;
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    vkCreatePipelineCache(dev.device, &ci, nullptr, &c);
+    c->keys = std::move(keys);
+    return c;
+}
+
+using CacheFiles = std::map<std::string, std::vector<uint8_t>>;
+CacheFiles cache_files() {
+    CacheFiles files;
+    for (const auto& e : std::filesystem::directory_iterator(pcache_dir)) {
+        std::ifstream in(e.path(), std::ios::binary);
+        files[e.path().filename().string()] = {std::istreambuf_iterator<char>(in), {}};
+    }
+    return files;
+}
+// (vk_draw.cpp's forced save as far as pcache_saved_now sees it: nothing under RX_VK_PCACHE_LOAD=0, else the whole cache in
+// the file. The real one is not extracted)
+void pipeline_cache_save(bool) {
+    if (!pcache || pcache_no_save) return;
+    write_file(pcache_path, "FAKE", keys_of(pcache));
+}
+#include "pcache_saved_now.inc"
+
+int run(const std::string& name) {
+    if (name.compare(0, 5, "load-") == 0) {
+        const char* value = std::getenv("RX_VK_PCACHE_LOAD");
+        const bool load_off = value && env_value_off(value);
+        const bool play_off = std::getenv("RX_VK_PLAY_CACHE") && std::atoi(std::getenv("RX_VK_PLAY_CACHE")) == 0;
+        write_file(pcache_path, "FAKE", {1});
+        std::set<uint64_t> imported{1};
+        for (uint32_t i = 1; i <= kPlayFilesKept; ++i) {
+            write_file(play_path(i), "FAKE", {100 + i});
+            imported.insert(100 + i);
+        }
+        const CacheFiles before = cache_files();
+        pcache_init();
+        play_cache_begin();
+        CHECK(make(999) == VK_SUCCESS && compiles == 1);   // (file loading off still makes the required pipeline)
+        play_cache_save();
+        CHECK(temporary_cleanups == 1);   // (routing only: the real temporary-file cleanup is not modelled here)
+        if (load_off) {
+            CHECK(cache_reads == 0 && merges == 0 && cache_data_writes == 0 && cache_publications == 0);
+            CHECK(!play_cache.load() && cache_files() == before);
+            CHECK(keys_of(pcache) == std::set<uint64_t>{999} && pipeline_calls == 1);
+            // (the warm pass's save: the base file left from before is no save of the cache that started empty, so the
+            // prepare record is not written as done)
+            CHECK(!pcache_saved_now() && cache_files() == before);
+        } else {
+            CHECK(cache_reads == 17 && merges == 16);
+            CHECK(cache_data_writes == (play_off ? 1 : 2) && cache_publications == (play_off ? 1 : 2));
+            CHECK(play_seq == (play_off ? 16u : 17u));
+            CHECK((play_cache.load() != nullptr) == !play_off);
+            CHECK(file_keys(pcache_path) == imported);
+            if (play_off) imported.insert(999);
+            CHECK(keys_of(pcache) == imported);
+            CHECK(cache_files().size() == (play_off ? 1u : 2u));
+            CHECK(pcache_saved_now() && file_keys(pcache_path) == keys_of(pcache));
+        }
+    } else if (name == "route") {
+        pcache = cache_of({1});   // (1: the start's cache alone has it)
+        driver = {2};             // (2: the driver's own cache alone)
+        CHECK(make(3) == VK_SUCCESS && has(pcache, 3) && compiles == 1);   // (before play: into the start's cache)
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        CHECK(g && g->cache);
+        const size_t start = size_of(pcache);
+        CHECK(make(1) == VK_SUCCESS && g->from_start == 1 && keys_of(g->cache).empty());
+        CHECK(make(2) == VK_SUCCESS && g->from_driver == 1 && keys_of(g->cache) == std::set<uint64_t>{2});
+        CHECK(make(4) == VK_SUCCESS && g->compiled == 1 && compiles == 2 && keys_of(g->cache) == (std::set<uint64_t>{2, 4}));
+        CHECK(g->built == 2);
+        // (one the caller already asks without compiling, as a dispatch does: the same order, no compile)
+        constexpr unsigned ask = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+        CHECK(make(5, ask) == VK_PIPELINE_COMPILE_REQUIRED);   // (nowhere: not compiled)
+        CHECK(compiles == 2 && !has(g->cache, 5) && !has(pcache, 5));
+        driver.insert(6);
+        CHECK(make(6, ask) == VK_SUCCESS && has(g->cache, 6) && !has(pcache, 6));   // (the driver's: into the generation)
+        CHECK(make(1, ask) == VK_SUCCESS && g->from_start == 2);   // (the start's cache's: from it)
+        CHECK(compiles == 2 && size_of(pcache) == start && keys_of(pcache) == (std::set<uint64_t>{1, 3}));   // (left as it was read)
+        // (a stage library asked without compiling: the start's cache first, where the warm pass put the libraries, so the
+        // driver's own cache is not gone to for it; then the generation; no compile)
+        constexpr unsigned lib = ask | VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+        const int64_t driver0 = g->from_driver.load(), built0 = g->built.load();
+        CHECK(make(7, lib) == VK_PIPELINE_COMPILE_REQUIRED && compiles == 2 && !has(g->cache, 7) && !has(pcache, 7));
+        CHECK(make(1, lib) == VK_SUCCESS && g->from_start == 3 && size_of(pcache) == start);   // (the start's cache's: from it)
+        CHECK(g->from_driver == driver0 && g->built == built0);                             // (and nothing asked of the generation)
+        driver.insert(8);
+        // (one the warm pass did not leave in the start's cache: the driver answers the ask of it and copies it in, in memory)
+        CHECK(make(8, lib) == VK_SUCCESS && g->from_start == 4 && has(pcache, 8) && !has(g->cache, 8));
+        {   // (one the generation alone holds, on a driver with no cache of its own: from the generation)
+            std::lock_guard lk(g->cache->mu);
+            g->cache->keys.insert(9);
+        }
+        CHECK(make(9, lib) == VK_SUCCESS && g->from_driver == driver0 + 1 && !has(pcache, 9));
+        CHECK(compiles == 2 && keys_of(pcache) == (std::set<uint64_t>{1, 3, 8}));
+        play_cache_begin();   // (once)
+        CHECK(play_cache.load() == g);
+    } else if (name == "save") {
+        pcache = cache_of({1});
+        play_cache_save();   // (before play: nothing)
+        CHECK(!exists(play_path(1)));
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        CHECK(make(10) == VK_SUCCESS && make(11) == VK_SUCCESS);
+        play_cache_save();
+        CHECK(file_keys(play_path(1)) == (std::set<uint64_t>{10, 11}) && play_seq == 1);
+        CHECK(play_cache.load() != g && keys_of(play_cache.load()->cache).empty() && !g->cache && destroys == 1);
+        CHECK(make(1) == VK_SUCCESS);   // (from the start's cache: nothing for a play file)
+        play_cache_save();
+        CHECK(!exists(play_path(2)));
+        CHECK(make(12) == VK_SUCCESS);
+        play_cache_save();
+        CHECK(file_keys(play_path(2)) == std::set<uint64_t>{12} && file_keys(play_path(1)) == (std::set<uint64_t>{10, 11}));
+        CHECK(keys_of(pcache) == std::set<uint64_t>{1});
+    } else if (name == "retry") {
+        pcache = cache_of({});
+        play_cache_begin();
+        CHECK(make(20) == VK_SUCCESS);
+        fail_moves = 1;
+        play_cache_save();   // (not in place: kept)
+        CHECK(failed_moves == 1 && !exists(play_path(1)) && play_seq == 0 && destroys == 0);
+        CHECK(make(21) == VK_SUCCESS);
+        play_cache_save();   // (the one kept first, then this one's)
+        CHECK(file_keys(play_path(1)) == std::set<uint64_t>{20} && file_keys(play_path(2)) == std::set<uint64_t>{21});
+        CHECK(destroys == 2 && play_seq == 2);
+    } else if (name == "users") {
+        pcache = cache_of({});
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        block_key = 30;
+        std::thread maker([] { make(30); });
+        CHECK(wait_for([] { return blocked.load(); }));
+        play_cache_save();   // (nothing made in it yet, only one under way: not taken away)
+        CHECK(play_cache.load() == g && !exists(play_path(1)));
+        CHECK(make(29) == VK_SUCCESS && g->built == 1);
+        std::atomic<bool> saved{false};
+        std::thread saver([&] { play_cache_save(); saved = true; });
+        CHECK(wait_for([&] { return play_cache.load() != g; }));   // (taken away; the save waits for the compile under way)
+        CHECK(make(31) == VK_SUCCESS && has(play_cache.load()->cache, 31) && !has(g->cache, 31));
+        Sleep(50);
+        CHECK(!saved.load() && !exists(play_path(1)));
+        release = true;
+        maker.join();
+        saver.join();
+        CHECK(file_keys(play_path(1)) == (std::set<uint64_t>{29, 30}));   // (the compile under way in its generation's file)
+        play_cache_save();
+        CHECK(file_keys(play_path(2)) == std::set<uint64_t>{31});
+        // (the fetch lock off: the window's close, play_cache_save with a bound, still waits for a build under way as before;
+        // on AMD's Windows driver one takes 5-13 s, and the play file is not given up for it)
+        CHECK(!pcache_fetch_lock_on());
+        blocked = false, release = false, block_key = 32;
+        std::thread maker2([] { make(32); });
+        CHECK(wait_for([] { return blocked.load(); }));
+        CHECK(make(33) == VK_SUCCESS);
+        std::atomic<bool> closed{false};
+        std::thread closer([&] { play_cache_save(100); closed = true; });
+        Sleep(400);
+        CHECK(!closed.load() && !exists(play_path(3)));
+        release = true;
+        maker2.join();
+        closer.join();
+        CHECK(file_keys(play_path(3)) == (std::set<uint64_t>{32, 33}));
+    } else if (name == "lock-users") {
+        // (the fetch lock on, https://github.com/NotRexed/Hookshot/issues/999: a save while a build is between two of
+        // create_cached's builds, counted in the generation and holding no lock. A save that held the lock while it waited for the
+        // generation's users would wait for that build, and the build for the lock, for good: the game frozen at a background save)
+        CHECK(pcache_fetch_lock_on());
+        pcache = cache_of({});
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        CHECK(make(1) == VK_SUCCESS && g->built == 1);
+        gap_key = 60;
+        std::atomic<bool> made{false}, saved{false};
+        std::thread maker([&] { made = make(60) == VK_SUCCESS; });
+        CHECK(wait_for([] { return in_gap.load(); }));
+        CHECK(g->users == 1);
+        std::thread saver([&] { play_cache_save(); saved = true; });
+        CHECK(wait_for([&] { return play_cache.load() != g; }));   // (taken away; the save waits for the build in it)
+        Sleep(50);
+        CHECK(!saved.load());
+        CHECK(pcache_fetch_mu.try_lock_shared());   // (and holds no fetch lock meanwhile: the build can go on)
+        pcache_fetch_mu.unlock_shared();
+        gap_go = true;
+        if (!wait_for([&] { return made.load() && saved.load(); })) {
+            std::fprintf(stderr, "FAIL line %d: the save and the build wait for each other\n", __LINE__);
+            std::_Exit(1);
+        }
+        maker.join();
+        saver.join();
+        CHECK(file_keys(play_path(1)) == (std::set<uint64_t>{1, 60}));
+        // (a build stuck in the driver at the window's close, pipeline_cache_close's bounded save: the generation is kept, the
+        // close does not hang; a later save writes it once the build is done)
+        PlayCache* g2 = play_cache.load();
+        block_key = 70;
+        std::thread stuck([] { make(70); });
+        CHECK(wait_for([] { return blocked.load(); }));
+        CHECK(make(71) == VK_SUCCESS && g2->built == 1);   // (another build goes on meanwhile)
+        const auto t0 = std::chrono::steady_clock::now();
+        play_cache_save(300);
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3));
+        CHECK(play_cache.load() != g2 && !exists(play_path(2)));
+        release = true;
+        stuck.join();
+        play_cache_save();
+        CHECK(file_keys(play_path(2)) == (std::set<uint64_t>{70, 71}));
+    } else if (name == "merge-read-failed" || name == "merge-create-failed") {
+        pcache = cache_of({1});
+        write_file(play_path(1), "FAKE", {40});
+        fail_reads = name == "merge-read-failed";
+        fail_cache_create = name == "merge-create-failed";
+        CHECK(play_files_merge() == 0);
+        CHECK(exists(play_path(1)) == (name == "merge-read-failed"));
+        fail_reads = false; fail_cache_create = false;
+        if(name == "merge-create-failed")write_file(play_path(1), "FAKE", {40});
+        CHECK(file_keys(play_path(1)) == std::set<uint64_t>{40});
+        CHECK(play_files_merge() == 1 && has(pcache, 40));
+    } else if (name == "merge") {
+        pcache = cache_of({1});
+        write_file(at("longshot_vk_pipelines_play_3.bin"), "FAKE", {40});
+        write_file(at("longshot_vk_pipelines_play_7.bin"), "FAKE", {41, 1});
+        write_file(at("longshot_vk_pipelines_play_5.bin"), "OTHR", {42});      // (another driver's: removed)
+        write_file(at("longshot_vk_pipelines_play_.bin"), "FAKE", {43});       // (not a play file's name: left alone)
+        write_file(at("longshot_vk_pipelines_play_x1.bin"), "FAKE", {44});
+        write_file(at("longshot_vk_pipelines_play_9.bin.tmp"), "FAKE", {45});
+        write_file(at("longshot_vk_pipelines_play_1234567890.bin"), "FAKE", {46});
+        write_file(pcache_path, "FAKE", {1});
+        CHECK(play_files_merge() == 2);
+        CHECK(keys_of(pcache) == (std::set<uint64_t>{1, 40, 41}) && play_seq == 7);
+        CHECK(!exists(at("longshot_vk_pipelines_play_5.bin")) && exists(at("longshot_vk_pipelines_play_.bin")));
+        CHECK(exists(at("longshot_vk_pipelines_play_x1.bin")) && exists(at("longshot_vk_pipelines_play_9.bin.tmp")));
+        CHECK(exists(at("longshot_vk_pipelines_play_1234567890.bin")));
+        CHECK(exists(at("longshot_vk_pipelines_play_3.bin")) && exists(at("longshot_vk_pipelines_play_7.bin")));   // (kept: under 16)
+        CHECK(file_keys(pcache_path) == std::set<uint64_t>{1});   // (the start's file as it was)
+        play_cache_begin();
+        CHECK(make(40) == VK_SUCCESS && play_cache.load()->from_start == 1);   // (merged: from the start's cache)
+        CHECK(make(47) == VK_SUCCESS);
+        play_cache_save();
+        CHECK(file_keys(play_path(8)) == std::set<uint64_t>{47});   // (numbered after the highest read)
+    } else if (name == "no-save") {
+        // (longshot, issue 388: the file not read, pcache_load.h) the play files neither merged nor written into the file, however
+        // many there are; play's generations still taken away at a save, and freed, with nothing written
+        pcache_no_save = true;
+        pcache = cache_of({});
+        write_file(pcache_path, "FAKE", {1, 2, 3});
+        for (uint64_t i = 1; i <= kPlayFilesKept + 2; i++) write_file(play_path((uint32_t)i), "FAKE", {100 + i});
+        CHECK(play_files_merge() == 0);
+        CHECK(keys_of(pcache).empty() && file_keys(pcache_path) == (std::set<uint64_t>{1, 2, 3}));   // (the file as it was)
+        for (uint32_t i = 1; i <= kPlayFilesKept + 2; i++) CHECK(exists(play_path(i)));             // (kept for a start that reads it)
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        CHECK(g && make(60) == VK_SUCCESS && g->built == 1);
+        play_cache_save();
+        CHECK(play_cache.load() != g && !exists(play_path(kPlayFilesKept + 3)));   // (taken away, nothing written)
+        CHECK(file_keys(pcache_path) == (std::set<uint64_t>{1, 2, 3}));
+        pcache_no_save = false;
+    } else if (name == "no-save-periodic") {
+        // (longshot, issue 388; PR 416's review) The file not read: the ordinary save, pipeline_cache_save(false) every 300 presents
+        // (vk_replay.cpp), still takes play's generation away and frees it once enough was built, on its thread, with nothing written:
+        // not the file, not a play file. Under its threshold it does nothing, and what is built next goes into the next generation
+        pcache_no_save = true;
+        pcache = cache_of({});
+        write_file(pcache_path, "FAKE", {1, 2, 3});
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        CHECK(g && make(60) == VK_SUCCESS && make(61) == VK_SUCCESS && g->built == 2);
+        const int destroyed = destroys.load();
+        pcache_built_since_save = 31;
+        pipeline_cache_save(false);   // (under the threshold: nothing)
+        Sleep(50);
+        CHECK(play_cache.load() == g && destroys == destroyed);
+        pcache_built_since_save = 32;   // (as the builds count it, vk_draw.cpp: enough for a save)
+        pipeline_cache_save(false);
+        CHECK(wait_for([&] { return destroys.load() == destroyed + 1; }));   // (the generation freed on the save's thread)
+        PlayCache* g2 = play_cache.load();
+        CHECK(g2 != g && g2 && g2->cache);
+        CHECK(make(62) == VK_SUCCESS && has(g2->cache, 62) && g2->built == 1);   // (new work goes on, into the next one)
+        pcache_built_since_save = 32;
+        pipeline_cache_save(false);
+        CHECK(wait_for([&] { return destroys.load() == destroyed + 2; }));
+        pipeline_cache_save(true);   // (a forced save, Restart now: after the background one; nothing built since, nothing freed)
+        CHECK(!g->cache && !g2->cache && destroys == destroyed + 2 && play_cache.load()->cache);
+        CHECK(file_keys(pcache_path) == (std::set<uint64_t>{1, 2, 3}));   // (the file as it was)
+        int files = 0;
+        for (const auto& e : std::filesystem::directory_iterator(pcache_dir)) {
+            files++;
+            CHECK(e.path().string() == pcache_path);
+        }
+        CHECK(files == 1);   // (no play file, no temporary file)
+        pcache_no_save = false;
+    } else if (name == "compact") {
+        pcache = cache_of({1});
+        write_file(pcache_path, "FAKE", {1});
+        std::set<uint64_t> all{1};
+        for (uint64_t i = 1; i <= kPlayFilesKept; i++) write_file(play_path((uint32_t)i), "FAKE", {100 + i}), all.insert(100 + i);
+        CHECK(play_files_merge() == kPlayFilesKept);
+        CHECK(keys_of(pcache) == all && file_keys(pcache_path) == all);   // (written into the one file)
+        for (uint32_t i = 1; i <= kPlayFilesKept; i++) CHECK(!exists(play_path(i)));
+        CHECK(play_seq == kPlayFilesKept);
+    } else if (name == "compact-failed") {
+        pcache = cache_of({1});
+        write_file(pcache_path, "FAKE", {1});
+        for (uint64_t i = 1; i <= kPlayFilesKept; i++) write_file(play_path((uint32_t)i), "FAKE", {100 + i});
+        fail_moves = 1;
+        CHECK(play_files_merge() == kPlayFilesKept);
+        CHECK(file_keys(pcache_path) == std::set<uint64_t>{1});   // (not in place: the play files stay for the next start)
+        for (uint32_t i = 1; i <= kPlayFilesKept; i++) CHECK(exists(play_path(i)));
+    } else if (name == "off" || name == "no-control") {
+        if (name == "no-control") dev.vk13.pipelineCreationCacheControl = false;
+        pcache = cache_of({});
+        play_cache_begin();
+        CHECK(!play_cache.load());
+        CHECK(make(50) == VK_SUCCESS && has(pcache, 50));   // (into the one cache, as before)
+        play_cache_save();
+        CHECK(!exists(play_path(1)));
+    } else {
+        CHECK(false);
+    }
+    std::printf("PASS: %s\n", name.c_str());
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc != 3) return 2;
+    pcache_dir = std::string(argv[2]) + "/";
+    pcache_path = pcache_dir + "longshot_vk_pipelines.bin";
+    return run(argv[1]);
+}
