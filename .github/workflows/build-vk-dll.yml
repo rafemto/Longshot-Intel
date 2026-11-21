@@ -68,6 +68,10 @@ jobs:
         env:
           RX_VK_ONLY: '1'
           RX_RELEASE: '1'
+          # Pin the CPU target: without RX_MARCH, nx2/build.py uses host_march() of the
+          # CI runner (AVX-512 server CPU) and the DLL fails to load (ERROR 1114) on
+          # Rafael's i3-8130U. x86-64-v3 is that CPU's exact level.
+          RX_MARCH: 'x86-64-v3'
         run: |
           OOT_WORK="$RUNNER_TEMP/vk-work" RX_CPM="$GITHUB_WORKSPACE/src/_deps/cpm" \
             python -I nx2/build.py --standalone --jobs "$(nproc)"
