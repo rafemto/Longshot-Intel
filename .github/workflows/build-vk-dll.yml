@@ -90,7 +90,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view vk-dll-v3.0.0-intel --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload vk-dll-v3.0.0-intel longshot_vk.dll --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload vk-dll-v3.0.0-intel-p1 longshot_vk.dll --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create vk-dll-v3.0.0-intel longshot_vk.dll --repo "$GITHUB_REPOSITORY" \
               --title "longshot_vk.dll v3.0.0 + parche Intel" \
