@@ -1426,6 +1426,36 @@ VkResult guarded_pipeline_cache_data(VkPipelineCache cache, size_t* size, void* 
     return r;
 }
 #endif
+// (longshot, Intel patch) vkCmdBeginRendering has no guard of its own either: on Intel's Windows driver it is the
+// call that faults opening a pass (igvk64 reads through a null object, one call past the guarded creates above), on
+// the presentation thread, with the game already in the world. The same answer as those guards: that pass is left
+// out (begin_pass keeps its targets out by their signature, as driver_faults.h keeps a program out)
+#ifdef _WIN32
+__declspec(noinline) bool guarded_begin_rendering(VkCommandBuffer cmd, const VkRenderingInfo* ri) {
+    __try {
+        vkCmdBeginRendering(cmd, ri);
+        return true;
+    } __except (1) {
+        note_driver_fault();
+        logf("vk: the driver faulted beginning a pass (exception %#lx): that pass is left out",
+             (unsigned long)GetExceptionCode());
+        return false;
+    }
+}
+#else
+bool guarded_begin_rendering(VkCommandBuffer cmd, const VkRenderingInfo* ri) {
+    install_driver_fault_guard();
+    if (sigsetjmp(fault_jmp, 1) != 0) {
+        note_driver_fault();
+        logf("vk: the driver faulted beginning a pass: that pass is left out");
+        return false;
+    }
+    fault_armed = 1;
+    vkCmdBeginRendering(cmd, ri);
+    fault_armed = 0;
+    return true;
+}
+#endif
 thread_local bool driver_cache_only = false;   // (predict_run's: pipelines for the driver's own cache, not into ours)
 thread_local bool quick_build = false;   // (longshot: quick_pipeline's, without the driver's optimizer and into no cache)
 thread_local bool gate_busy = false;   // (longshot: set by build_graphics when the driver-fault gate answered kBusy: quick_pipeline's)
@@ -5131,6 +5161,15 @@ struct Pass {
     std::vector<const Texture*> sampled;   // First six distinct samples for pass tracing only.
     uint16_t sampled_targets = 0;          // (colour i bit i, depth bit 8: targets earlier draws sampled)
     uint16_t written = 0;                  // (its targets written so far: colour i bit i, depth bit 8)
+    // (Intel patch: the pass the driver faulted beginning, kept out by its targets' signature, as a faulted
+    // program is kept out by its key: begin_pass stores the signature here and never calls the driver for it again)
+    bool begin_faulted = false;
+    VkImageView fault_color[8]{};
+    Texture* fault_tex[8]{};
+    VkImageView fault_depth = VK_NULL_HANDLE;
+    Texture* fault_depth_tex = nullptr;
+    int fault_n = 0;
+    uint32_t fault_width = 0, fault_height = 0;
 };
 TLS_OBJECT(pass, Pass)
 thread_local bool work_since_barrier = false;   // (GPU work recorded since the last full barrier: a dispatch orders after it)
@@ -5249,6 +5288,13 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     for (int i = 0; i < at.n && same; i++) same = ps.color[i] == at.color_view[i];
     if (same) return;
     end_pass(cmd);
+    if (ps.begin_faulted && ps.fault_n == at.n && ps.fault_width == at.width && ps.fault_height == at.height &&
+        ps.fault_depth == at.depth_view && ps.fault_depth_tex == at.depth) {
+        bool fsame = true;
+        for (int i = 0; i < at.n && fsame; i++)
+            fsame = ps.fault_color[i] == at.color_view[i] && ps.fault_tex[i] == at.color[i];
+        if (fsame) return;   // (the pass the driver faulted beginning: kept out, the pass stays closed)
+    }
     if (at.has_block_images) {
         full_barrier(cmd, "barrier (before BC slice loads)");
         for (int i = 0; i < at.n; i++)
@@ -5301,7 +5347,13 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     ps.wm_or = 0, ps.wm_n = 0;
     ps.clears = 0, ps.first_prog = 0;
     ps.sampled.clear(), ps.sampled_targets = 0, ps.written = 0;
-    vkCmdBeginRendering(cmd, &ri);
+    if (!guarded_begin_rendering(cmd, &ri)) {
+        ps.begin_faulted = true;
+        ps.fault_depth = at.depth_view, ps.fault_depth_tex = at.depth;
+        ps.fault_n = at.n, ps.fault_width = at.width, ps.fault_height = at.height;
+        for (int i = 0; i < at.n; i++) ps.fault_color[i] = at.color_view[i], ps.fault_tex[i] = at.color[i];
+        return;   // (the pass stays closed: its draws and clears are left out by the checks at the callers)
+    }
     ps.open = true;
     st_passes++;
 }
@@ -5928,6 +5980,7 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
     if (index < 0 || index >= at.n || !at.color_view[index]) return;
     clear_after_draws(cmd);
     begin_pass(cmd, at);
+    if (!pass().open) return;   // (the driver faulted beginning the pass: the clear is left out with it)
     const uint32_t lw = at.width, lh = at.height;
     const VkRect2D rect = clear_rect(s, lw, lh);
     if (!rect.extent.width || !rect.extent.height) return;
@@ -5973,6 +6026,7 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
     }
     clear_after_draws(cmd);
     begin_pass(cmd, at);
+    if (!pass().open) return;   // (the driver faulted beginning the pass: the clear is left out with it)
     const VkRect2D rect = clear_rect(s, at.width, at.height);
     if (!rect.extent.width || !rect.extent.height) return;
     VkClearAttachment ca{};
@@ -8423,6 +8477,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);
     }
+    if (!ps.open) SKIP_HERE();   // (the driver faulted beginning the pass: the pass is left out, and this draw with it)
     probe_draw(s, p, ps.draws);   // (longshot: RX_VK_PROBE)
     gprof_run(cmd, p.key);   // (RX_VK_PASS_TIMING=2)
     ps.prog = p.key;
